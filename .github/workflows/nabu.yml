@@ -37,7 +37,6 @@ env:
   MANIFEST_BRANCH: twrp-11
   PRODUCT: twrp_OWW251
   BUILD_DIR: /mnt/oww251
-  TWRP_EXTRAS_URL: https://raw.githubusercontent.com/minimal-manifest-twrp/platform_manifest_twrp_aosp/twrp-11/twrp-extras.xml
 
 jobs:
   build:
@@ -120,25 +119,18 @@ jobs:
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
         fi
 
-        # TWRP 本体（bootable/recovery / build/make / vendor/twrp）都在 twrp-extras.xml 里。
-        # default.xml 末尾 include 了 remove.xml，已经把 7 个重名项目摘掉了；
-        # 只剩 system/sepolicy 和 hardware/interfaces 两个还与 AOSP 冲突，
-        # 不摘掉 repo 会报 "duplicate path"。
-        # 注意：remove-project 只能摘「当前存在」的项目，摘已摘过的会报
-        #   "remove-project element specifies non-existent project"，所以只写这 2 条。
-        echo "=== 生成 TWRP 本地清单（AOSP 去重 + twrp-extras） ==="
-        mkdir -p .repo/local_manifests
-        curl -fsSL "$TWRP_EXTRAS_URL" -o /tmp/twrp-extras.xml
-        {
-          echo '<?xml version="1.0" encoding="UTF-8"?>'
-          echo '<manifest>'
-          echo '  <remove-project name="platform/system/sepolicy" />'
-          echo '  <remove-project name="platform/hardware/interfaces" />'
-          grep -vE '<\?xml|<manifest>|</manifest>' /tmp/twrp-extras.xml
-          echo '</manifest>'
-        } > .repo/local_manifests/twrp.xml
-        python3 -c "import xml.etree.ElementTree as E; E.parse('.repo/local_manifests/twrp.xml'); print('本地清单 XML 合法')"
-        echo "  project 数：$(grep -c '<project' .repo/local_manifests/twrp.xml)  去重数：$(grep -c '<remove-project' .repo/local_manifests/twrp.xml)"
+        # 关键：TWRP overlay 不需要 local manifest！
+        # default.xml -> include remove.xml -> include remove-minimal.xml -> include twrp-extras.xml，
+        # 已经自动带上 TeamWin 版 bootable/recovery / build/make / build/soong 和 vendor/twrp。
+        # 早先手动塞一份 twrp-extras.xml 进 local_manifests 反而造成 duplicate path。
+        echo "=== 校验清单自带 TWRP 项目 ==="
+        repo manifest -o /tmp/merged.xml
+        for p in vendor/twrp bootable/recovery build/make build/soong device/qcom/twrp-common; do
+          n=$(grep -c "path=\"$p\"" /tmp/merged.xml || true)
+          printf "  %-26s %s\n" "$p" "$n"
+          [ "$n" -ge 1 ] || { echo "清单里缺 $p，停止"; exit 1; }
+        done
+        echo "  合并后 project 总数：$(grep -c '<project' /tmp/merged.xml)"
 
         echo "=== repo sync ==="
         repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
@@ -176,7 +168,6 @@ jobs:
           -e DEVICE_PATH="${{ github.event.inputs.DEVICE_PATH }}" \
           -e DEVICE_NAME="${{ github.event.inputs.DEVICE_NAME }}" \
           -e BUILD_TARGET="${{ github.event.inputs.BUILD_TARGET }}" \
-          -e TWRP_EXTRAS_URL="$TWRP_EXTRAS_URL" \
           ubuntu:20.04 bash /inner.sh
 
     - name: 汇总信息
