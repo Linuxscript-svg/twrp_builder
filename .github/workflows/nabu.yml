@@ -142,7 +142,6 @@ jobs:
         export LC_ALL=C
         source build/envsetup.sh
         lunch "${PRODUCT}-eng"
-        make clean
         # shellcheck disable=SC2086
         mka $BUILD_TARGET -j"$(nproc --all)"
 
