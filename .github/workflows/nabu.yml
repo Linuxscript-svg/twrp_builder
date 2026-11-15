@@ -29,7 +29,7 @@ on:
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
-default: 'recoveryimage'
+        default: 'recoveryimage'
 
 env:
   TZ: Asia/Shanghai
@@ -67,7 +67,7 @@ jobs:
         set -e
         mkdir -p "$GITHUB_WORKSPACE/workspace"
         cat > /tmp/inner.sh <<'EOS'
-#!/bin/bash
+        #!/bin/bash
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
@@ -88,7 +88,7 @@ jobs:
         cd /workspace
         if [ ! -d .repo ]; then
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
-fi
+        fi
         repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
 
         if [ -d "$DEVICE_PATH/.git" ]; then
@@ -117,7 +117,7 @@ fi
           -v "$GITHUB_WORKSPACE/workspace":/workspace \
           -v /tmp/inner.sh:/inner.sh:ro \
           -e MANIFEST_URL="$MANIFEST_URL" \
--e MANIFEST_BRANCH="$MANIFEST_BRANCH" \
+          -e MANIFEST_BRANCH="$MANIFEST_BRANCH" \
           -e PRODUCT="$PRODUCT" \
           -e DEVICE_URL="${{ github.event.inputs.DEVICE_URL }}" \
           -e DEVICE_BRANCH="${{ github.event.inputs.DEVICE_BRANCH }}" \
