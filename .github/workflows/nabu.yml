@@ -120,12 +120,27 @@ jobs:
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
         fi
 
-        # TWRP 本体（bootable/recovery / build/make / vendor/twrp）都在 twrp-extras.xml 里，
-        # 必须作为 local manifest 加载，否则 sync 下来的只是纯 AOSP
-        echo "=== 加载 twrp-extras local manifest ==="
+        # TWRP 本体（bootable/recovery / build/make / vendor/twrp）都在 twrp-extras.xml 里。
+        # 但 extras 里 9 个 path 与 default.xml 重复，repo 会直接报
+        #   "duplicate path bootable/recovery" 并中止，
+        # 所以必须先把 AOSP 的同名 project 用 remove-project 摘掉，再并入 extras。
+        echo "=== 生成 TWRP 本地清单（AOSP 去重 + twrp-extras） ==="
         mkdir -p .repo/local_manifests
-        curl -fsSL "$TWRP_EXTRAS_URL" -o .repo/local_manifests/twrp-extras.xml
-        grep -c "project" .repo/local_manifests/twrp-extras.xml
+        curl -fsSL "$TWRP_EXTRAS_URL" -o /tmp/twrp-extras.xml
+        {
+          echo '<?xml version="1.0" encoding="UTF-8"?>'
+          echo '<manifest>'
+          for n in platform/bootable/recovery platform/build platform/build/soong \
+                   platform/external/bouncycastle platform/hardware/interfaces \
+                   platform/system/core platform/system/libhidl platform/system/sepolicy \
+                   platform/system/update_engine; do
+            echo "  <remove-project name=\"$n\" />"
+          done
+          grep -vE '<\?xml|<manifest>|</manifest>' /tmp/twrp-extras.xml
+          echo '</manifest>'
+        } > .repo/local_manifests/twrp.xml
+        python3 -c "import xml.etree.ElementTree as E; E.parse('.repo/local_manifests/twrp.xml'); print('本地清单 XML 合法')"
+        echo "  project 数：$(grep -c '<project' .repo/local_manifests/twrp.xml)  去重数：$(grep -c '<remove-project' .repo/local_manifests/twrp.xml)"
 
         echo "=== repo sync ==="
         repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
