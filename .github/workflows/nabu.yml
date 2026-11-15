@@ -1,11 +1,11 @@
-name: Build TWRP OWW251 (hosted, ubuntu20 container)
+name: Build TWRP OWW251 (hosted, /mnt disk + ubuntu20 container)
 
-# 适用场景：本机没内存/没大盘，用 GitHub 免费托管 runner 编译 Android 11 的 TWRP。
-# 关键点：
-#  1) 托管 runner 现在只有 ubuntu-latest(24.04)，但 AOSP 11 需要 20.04 的依赖 —— 所以编译跑在
-#     ubuntu:20.04 容器里（docker run，不是 container: 关键字，这样宿主步骤还能清理磁盘）。
-#  2) 磁盘靠 maximize-build-space 把 /usr/share/dotnet 等挪走，腾出 ~50GB。
-#  3) 源码放在 bind mount 里（$GITHUB_WORKSPACE/workspace），产物出门后由 upload-artifact 收走。
+# 目标：本机没内存/没大盘，用 GitHub 免费托管 runner 编 Android 11 的 TWRP。
+# 设计（针对上一版失败原因修正）：
+#  - 不再用 maximize-build-space 搬根目录（上次它导致 docker 在搬完后被硬中断）。
+#  - GitHub runner 自带一块 /mnt 数据盘（约 65-74GB），把 docker 数据目录和源码都放这里，
+#    根盘（约 14GB 可用）只放系统，不受影响。
+#  - 编译跑在 ubuntu:20.04 容器里（AOSP 11 的真依赖：openjdk-8 / python2 / lib32ncurses5）。
 
 on:
   workflow_dispatch:
@@ -36,6 +36,7 @@ env:
   MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp
   MANIFEST_BRANCH: twrp-11
   PRODUCT: omni_OWW251
+  BUILD_DIR: /mnt/oww251
 
 jobs:
   build:
@@ -44,29 +45,39 @@ jobs:
     timeout-minutes: 350
 
     steps:
-    - name: 腾磁盘（把 root 挪到 /mnt，删 dotnet/android/haskell）
-      uses: easimon/maximize-build-space@v6
-      with:
-        root-reserve-mb: 2048
-        swap-size-mb: 4096
-        remove-dotnet: 'true'
-        remove-android: 'true'
-        remove-haskell: 'true'
-
-    - name: 宿主机自检
+    - name: 磁盘与内核参数自检
       run: |
-        . /etc/os-release; echo "runner: $PRETTY_NAME"
-        echo "CPU $(nproc) 核  内存 $(free -g | awk 'NR==2{print $2}')GB"
-        df -h | grep -E "Filesystem|/mnt|/workspace|/$"
+        echo "=== 磁盘 ==="; df -h
+        echo "=== /mnt ==="; ls -ld /mnt; df -h /mnt || true
+        echo "=== CPU/内存 ==="; nproc; free -g
+        echo "=== docker ==="; docker version --format '{{.Server.Version}}' || true
+
+    - name: 把 docker 数据目录与构建目录放到 /mnt
+      run: |
+        set -e
+        sudo df -h /mnt
+        sudo mkdir -p /mnt/docker /mnt/oww251
+        sudo chown -R "$USER":"$USER" /mnt/oww251
+        # docker 数据目录换到 /mnt，避免根盘（~14GB）被镜像和 overlay 撑爆
+        sudo systemctl stop docker || true
+        echo '{"data-root":"/mnt/docker"}' | sudo tee /etc/docker/daemon.json
+        sudo systemctl start docker
+        sleep 3
+        docker info --format 'data-root={{.DockerRootDir}}  driver={{.Driver}}'
+        sudo df -h /mnt
 
     - name: 拉取 ubuntu:20.04
-      run: docker pull ubuntu:20.04
+      run: |
+        for i in 1 2; do
+          docker pull ubuntu:20.04 && break || { echo "第 $i 次失败，重试"; sleep 5; }
+        done
+        docker image inspect ubuntu:20.04 --format 'image ok: {{.Id}}'
 
     - name: 编译（容器内）
       run: |
         set -e
-        mkdir -p "$GITHUB_WORKSPACE/workspace"
-        cat > /tmp/inner.sh <<'EOS'
+        mkdir -p "$BUILD_DIR/workspace"
+        cat > "$RUNNER_TEMP/inner.sh" <<'EOS'
         #!/bin/bash
         set -e
         export DEBIAN_FRONTEND=noninteractive
@@ -78,44 +89,46 @@ jobs:
           unzip jq bc ccache rsync tree python2 libssl-dev liblz4-tool \
           libncurses5-dev libsdl1.2-dev libwxgtk3.0-dev openjdk-8-jdk \
           squashfs-tools pngcrush lzop imagemagick qemu-user-static
-        # repo 工具
         curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
         chmod +x /usr/local/bin/repo
         git config --global user.name "Build Bot"
         git config --global user.email "build@localhost"
         git config --global --add safe.directory '*'
+        echo "=== 容器内磁盘 ==="; df -h /workspace
 
         cd /workspace
         if [ ! -d .repo ]; then
           repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
         fi
+        echo "=== repo sync ==="
         repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
 
+        echo "=== 克隆设备树 ==="
         if [ -d "$DEVICE_PATH/.git" ]; then
-          git -C "$DEVICE_PATH" fetch origin "$DEVICE_BRANCH"
-          git -C "$DEVICE_PATH" checkout "$DEVICE_BRANCH"
+          git -C "$DEVICE_PATH" fetch origin "$DEVICE_BRANCH" && git -C "$DEVICE_PATH" checkout "$DEVICE_BRANCH"
         else
           git clone "$DEVICE_URL" -b "$DEVICE_BRANCH" "./$DEVICE_PATH"
         fi
 
+        echo "=== 编译 ==="
         export ALLOW_MISSING_DEPENDENCIES=true
         export LC_ALL=C
-        export USE_CCACHE=0
         source build/envsetup.sh
         lunch "${PRODUCT}-eng"
         make clean
         # shellcheck disable=SC2086
         mka $BUILD_TARGET -j"$(nproc --all)"
 
+        echo "=== 收产物 ==="
         mkdir -p /workspace/dist
         OUT="/workspace/out/target/product/$DEVICE_NAME"
-        cp -v "$OUT"/*.img "$OUT"/*.zip /workspace/dist/ 2>/dev/null || true
+        cp -v "$OUT"/*.img "$OUT"/*.zip /workspace/dist/ 2>/dev/null || echo "无 .img/.zip 产物"
         ls -lh /workspace/dist || true
         EOS
-        chmod +x /tmp/inner.sh
+        chmod +x "$RUNNER_TEMP/inner.sh"
         docker run --rm \
-          -v "$GITHUB_WORKSPACE/workspace":/workspace \
-          -v /tmp/inner.sh:/inner.sh:ro \
+          -v "$BUILD_DIR/workspace":/workspace \
+          -v "$RUNNER_TEMP/inner.sh":/inner.sh:ro \
           -e MANIFEST_URL="$MANIFEST_URL" \
           -e MANIFEST_BRANCH="$MANIFEST_BRANCH" \
           -e PRODUCT="$PRODUCT" \
@@ -129,9 +142,9 @@ jobs:
     - name: 汇总信息
       if: always()
       run: |
-        df -h | grep -E "Filesystem|/mnt|/$" || true
-        du -sh "$GITHUB_WORKSPACE/workspace" 2>/dev/null || true
-        ls -lh "$GITHUB_WORKSPACE/workspace/dist" 2>/dev/null || echo "没有产物"
+        df -h / /mnt || true
+        du -sh "$BUILD_DIR" 2>/dev/null || true
+        ls -lh "$BUILD_DIR/workspace/dist" 2>/dev/null || echo "没有产物"
 
     - name: 上传 artifact
       if: always()
@@ -139,8 +152,8 @@ jobs:
       with:
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         path: |
-          workspace/dist/*.img
-          workspace/dist/*.zip
+          /mnt/oww251/workspace/dist/*.img
+          /mnt/oww251/workspace/dist/*.zip
         if-no-files-found: warn
 
     - name: 发布 Release
@@ -148,8 +161,8 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          workspace/dist/*.img
-          workspace/dist/*.zip
+          /mnt/oww251/workspace/dist/*.img
+          /mnt/oww251/workspace/dist/*.zip
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: TWRP for ${{ github.event.inputs.DEVICE_NAME }} (android-11 / twrp-11)
