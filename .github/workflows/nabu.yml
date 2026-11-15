@@ -1,137 +1,137 @@
-name: Make nabu Recovery (self-hosted)
+name: Build TWRP OWW251 (hosted, ubuntu20 container)
 
-# 用你自己的服务器跑：GitHub 托管的 ubuntu-20.04 / 22.04 都已下线，
-# 而 AOSP 11 在 24.04 上基本编不动（没有 python2 / openjdk-8 / libncurses5）。
-# 自建 runner 是这台设备最省事的方案。
+# 适用场景：本机没内存/没大盘，用 GitHub 免费托管 runner 编译 Android 11 的 TWRP。
+# 关键点：
+#  1) 托管 runner 现在只有 ubuntu-latest(24.04)，但 AOSP 11 需要 20.04 的依赖 —— 所以编译跑在
+#     ubuntu:20.04 容器里（docker run，不是 container: 关键字，这样宿主步骤还能清理磁盘）。
+#  2) 磁盘靠 maximize-build-space 把 /usr/share/dotnet 等挪走，腾出 ~50GB。
+#  3) 源码放在 bind mount 里（$GITHUB_WORKSPACE/workspace），产物出门后由 upload-artifact 收走。
 
 on:
   workflow_dispatch:
     inputs:
-      LIBRARY_NAME:
-        description: 'LIBRARY_NAME'
-        required: true
-        default: 'twrp'
-      LIBRARY_URL:
-        description: 'LIBRARY_URL'
-        required: true
-        default: 'https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp'
-      LIBRARY_BRANCH:
-        description: 'LIBRARY_BRANCH'
-        required: true
-        default: 'twrp-11'
       DEVICE_URL:
         description: 'DEVICE_URL'
         required: true
-        default: 'https://github.com/bm0x/android_device_xiaomi_nabu'
+        default: 'https://github.com/Linuxscript-svg/android_device_oppo_OWW251'
       DEVICE_BRANCH:
         description: 'DEVICE_BRANCH'
         required: true
-        default: 'a11'
+        default: 'master'
       DEVICE_PATH:
         description: 'DEVICE_PATH'
         required: true
-        default: 'device/xiaomi/nabu'
+        default: 'device/oppo/OWW251'
       DEVICE_NAME:
         description: 'DEVICE_NAME'
         required: true
-        default: 'nabu'
+        default: 'OWW251'
       BUILD_TARGET:
         description: 'BUILD_TARGET'
         required: true
-        default: 'adbd bootimage'
+default: 'recoveryimage'
 
 env:
   TZ: Asia/Shanghai
-  WORKDIR: ${{ github.workspace }}/build
+  MANIFEST_URL: https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp
+  MANIFEST_BRANCH: twrp-11
+  PRODUCT: omni_OWW251
 
 jobs:
   build:
-    # 只要 runner 上带 self-hosted 标签就会被选中；不需要 ubuntu-20.04 这种托管标签
-    runs-on: [self-hosted, linux]
-    timeout-minutes: 720
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
-    - name: 环境自检
-      run: |
-        . /etc/os-release
-        echo "系统：$PRETTY_NAME"
-        echo "CPU：$(nproc) 核  内存：$(free -g | awk 'NR==2{print $2}') GB"
-        echo "可用磁盘：$(df -h "$WORKDIR" 2>/dev/null | awk 'NR==2{print $4}')"
-        command -v repo || echo "缺 repo（脚本会自动装）"
+    - name: 腾磁盘（把 root 挪到 /mnt，删 dotnet/android/haskell）
+      uses: easimon/maximize-build-space@v6
+      with:
+        root-reserve-mb: 2048
+        swap-size-mb: 4096
+        remove-dotnet: 'true'
+        remove-android: 'true'
+        remove-haskell: 'true'
 
-    # 自建 runner 上不需要 maximize-build-space（那是为了撑爆 GitHub 的 14GB 盘）
-    - name: Check Out
-      uses: actions/checkout@v4
-
-    - name: 依赖检查与安装
+    - name: 宿主机自检
       run: |
-        MISSING=""
-        for p in git curl repo ccache zip unzip rsync jq bc tree python3 flex bison gperf; do
-          command -v "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
-        done
-        if [ -n "$MISSING" ]; then
-          echo "缺少：$MISSING"
-          sudo apt-get update -y
-          sudo apt-get -y install git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-            gcc-multilib g++-multilib libc6-dev-i386 ccache rsync bc tree jq \
-            lib32z1-dev libx11-dev libgl1-mesa-dev libxml2-utils xsltproc unzip \
-            libncurses5-dev libxml2 lzop pngcrush schedtool squashfs-tools \
-            imagemagick libbz2-dev libssl-dev lzma ncftp bash-completion python2 qemu-user-static || true
-          sudo apt-get -y install libwxgtk3.0-dev openjdk-8-jdk || \
-          sudo apt-get -y install libwxgtk3.0-gtk3-dev openjdk-11-jdk || true
-        else
-          echo "依赖齐全"
-        fi
-        command -v repo >/dev/null 2>&1 || { mkdir -p "$HOME/bin"; curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"; chmod +x "$HOME/bin/repo"; echo "$HOME/bin" >> "$GITHUB_PATH"; }
+        . /etc/os-release; echo "runner: $PRETTY_NAME"
+        echo "CPU $(nproc) 核  内存 $(free -g | awk 'NR==2{print $2}')GB"
+        df -h | grep -E "Filesystem|/mnt|/workspace|/$"
 
-    - name: repo init
+    - name: 拉取 ubuntu:20.04
+      run: docker pull ubuntu:20.04
+
+    - name: 编译（容器内）
       run: |
-        mkdir -p "$WORKDIR/workspace"
-        cd "$WORKDIR/workspace"
+        set -e
+        mkdir -p "$GITHUB_WORKSPACE/workspace"
+        cat > /tmp/inner.sh <<'EOS'
+#!/bin/bash
+        set -e
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends \
+          git gnupg flex bison build-essential zip curl zlib1g-dev \
+          gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev \
+          libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
+          unzip jq bc ccache rsync tree python2 libssl-dev liblz4-tool \
+          libncurses5-dev libsdl1.2-dev libwxgtk3.0-dev openjdk-8-jdk \
+          squashfs-tools pngcrush lzop imagemagick qemu-user-static
+        # repo 工具
+        curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
+        chmod +x /usr/local/bin/repo
         git config --global user.name "Build Bot"
         git config --global user.email "build@localhost"
-        if [ ! -d .repo ]; then
-          repo init --depth=1 -u "${{ github.event.inputs.LIBRARY_URL }}" -b "${{ github.event.inputs.LIBRARY_BRANCH }}"
-        fi
+        git config --global --add safe.directory '*'
 
-    - name: repo sync
-      run: |
-        cd "$WORKDIR/workspace"
+        cd /workspace
+        if [ ! -d .repo ]; then
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH"
+fi
         repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
 
-    - name: 克隆设备树
-      run: |
-        cd "$WORKDIR/workspace"
-        if [ -d "${{ github.event.inputs.DEVICE_PATH }}/.git" ]; then
-          git -C "${{ github.event.inputs.DEVICE_PATH }}" fetch origin "${{ github.event.inputs.DEVICE_BRANCH }}"
-          git -C "${{ github.event.inputs.DEVICE_PATH }}" checkout "${{ github.event.inputs.DEVICE_BRANCH }}"
-          git -C "${{ github.event.inputs.DEVICE_PATH }}" pull --ff-only || true
+        if [ -d "$DEVICE_PATH/.git" ]; then
+          git -C "$DEVICE_PATH" fetch origin "$DEVICE_BRANCH"
+          git -C "$DEVICE_PATH" checkout "$DEVICE_BRANCH"
         else
-          git clone "${{ github.event.inputs.DEVICE_URL }}" -b "${{ github.event.inputs.DEVICE_BRANCH }}" "./${{ github.event.inputs.DEVICE_PATH }}"
+          git clone "$DEVICE_URL" -b "$DEVICE_BRANCH" "./$DEVICE_PATH"
         fi
-        [ -d hardware/xiaomi/.git ] || git clone https://github.com/LineageOS/android_hardware_xiaomi.git -b lineage-18.1 ./hardware/xiaomi || true
 
-    - name: 编译
-      run: |
-        cd "$WORKDIR/workspace"
         export ALLOW_MISSING_DEPENDENCIES=true
         export LC_ALL=C
-        export USE_CCACHE=1
-        export CCACHE_DIR="$WORKDIR/.ccache"
-        ccache -M 30G || true
+        export USE_CCACHE=0
         source build/envsetup.sh
-        lunch "${{ github.event.inputs.LIBRARY_NAME }}_${{ github.event.inputs.DEVICE_NAME }}-eng"
-        make clean && make clobber
-        mka ${{ github.event.inputs.BUILD_TARGET }} -j"$(nproc --all)"
+        lunch "${PRODUCT}-eng"
+        make clean
+        # shellcheck disable=SC2086
+        mka $BUILD_TARGET -j"$(nproc --all)"
 
-    - name: 收产物
+        mkdir -p /workspace/dist
+        OUT="/workspace/out/target/product/$DEVICE_NAME"
+        cp -v "$OUT"/*.img "$OUT"/*.zip /workspace/dist/ 2>/dev/null || true
+        ls -lh /workspace/dist || true
+        EOS
+        chmod +x /tmp/inner.sh
+        docker run --rm \
+          -v "$GITHUB_WORKSPACE/workspace":/workspace \
+          -v /tmp/inner.sh:/inner.sh:ro \
+          -e MANIFEST_URL="$MANIFEST_URL" \
+-e MANIFEST_BRANCH="$MANIFEST_BRANCH" \
+          -e PRODUCT="$PRODUCT" \
+          -e DEVICE_URL="${{ github.event.inputs.DEVICE_URL }}" \
+          -e DEVICE_BRANCH="${{ github.event.inputs.DEVICE_BRANCH }}" \
+          -e DEVICE_PATH="${{ github.event.inputs.DEVICE_PATH }}" \
+          -e DEVICE_NAME="${{ github.event.inputs.DEVICE_NAME }}" \
+          -e BUILD_TARGET="${{ github.event.inputs.BUILD_TARGET }}" \
+          ubuntu:20.04 bash /inner.sh
+
+    - name: 汇总信息
       if: always()
       run: |
-        OUT="$WORKDIR/workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}"
-        DST="$WORKDIR/artifacts/$(date +%F_%H%M)"
-        mkdir -p "$DST"
-        cp -v "$OUT"/*.zip "$OUT"/*.img "$DST"/ 2>/dev/null || echo "没有产物，检查 $OUT"
-        ls -lh "$DST"
+        df -h | grep -E "Filesystem|/mnt|/$" || true
+        du -sh "$GITHUB_WORKSPACE/workspace" 2>/dev/null || true
+        ls -lh "$GITHUB_WORKSPACE/workspace/dist" 2>/dev/null || echo "没有产物"
 
     - name: 上传 artifact
       if: always()
@@ -139,8 +139,8 @@ jobs:
       with:
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         path: |
-          build/artifacts/**/*.zip
-          build/artifacts/**/*.img
+          workspace/dist/*.img
+          workspace/dist/*.zip
         if-no-files-found: warn
 
     - name: 发布 Release
@@ -148,10 +148,10 @@ jobs:
       uses: softprops/action-gh-release@v2
       with:
         files: |
-          build/artifacts/**/*.zip
-          build/artifacts/**/*.img
+          workspace/dist/*.img
+          workspace/dist/*.zip
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
-        body: Recovery for ${{ github.event.inputs.DEVICE_NAME }}
+        body: TWRP for ${{ github.event.inputs.DEVICE_NAME }} (android-11 / twrp-11)
       env:
         GITHUB_TOKEN: ${{ secrets.work }}
