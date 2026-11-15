@@ -31,6 +31,10 @@ on:
         description: 'DEVICE_NAME'
         required: true
         default: 'nabu'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET'
+        required: true
+        default: 'adbd bootimage'
 
 env:
   TZ: Asia/Shanghai
@@ -38,86 +42,102 @@ env:
 jobs:
   build:
     if: github.event.repository.owner.id == github.event.sender.id
-    runs-on: ubuntu-18.04
-    
+    # 18.04 runner 已下架；AOSP 11 在 20.04 上最稳（22.04 缺 python2 / openjdk-8）
+    runs-on: ubuntu-20.04
+    timeout-minutes: 360
+
     steps:
+    # 只保留必要的一步清理：删 dotnet/haskell/android，扩 swap（不删系统目录）
     - name: Maximize build disk space
-      uses: easimon/maximize-build-space@v5
+      uses: easimon/maximize-build-space@v6
       with:
-        root-reserve-mb: 1024
+        root-reserve-mb: 2048
         swap-size-mb: 6144
         remove-dotnet: 'true'
-        temp-reserve-mb: 1024
         remove-android: 'true'
         remove-haskell: 'true'
+        temp-reserve-mb: 1024
 
     - name: Check Out
-      uses: actions/checkout@main
+      uses: actions/checkout@v4
 
     - name: Prepare the environment
       run: |
-        docker rmi `docker images -q`
-        sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /etc/sudo apt/sources.list.d
-        sudo apt -y purge azure-cli ghc* zulu* hhvm llvm* firefox google* dotnet* powershell openjdk* mysql* php*
-        sudo apt -y autoremove --purge
-        sudo apt -y autoclean
-        sudo apt clean
-        sudo apt update
-        sudo apt -y install git-core gnupg flex bison gperf build-essential zip curl zlib1g-dev gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev libx11-dev tree lib32z-dev libgl1-mesa-dev libxml2-utils xsltproc unzip jq bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf lib32ncurses5-dev lib32readline-dev lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev libwxgtk3.0-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev imagemagick libbz2-dev libssl-dev lzma ncftp bash-completion python openjdk-8-jdk qemu-user-static
-      
-    - name: Set variables
-      run: |
-        echo "::set-output name=date::$(date +%F)"
-      id: var
-      
+        sudo apt-get clean
+        sudo apt-get update -y
+        # 注意：原版这行里的 `sudo rm -rf ... /etc/sudo` 会删掉 sudo 自身，已移除
+        sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php
+        sudo apt-get -y --purge remove 'azure-cli' 'ghc*' 'zulu*' 'hhvm' 'llvm*' 'firefox*' 'google*' 'dotnet*' 'powershell*' 'mysql*' 'php*' || true
+        sudo apt-get -y autoremove --purge || true
+        sudo apt-get -y autoclean || true
+        sudo apt-get -y install \
+          git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+          gcc-multilib g++-multilib libc6-dev-i386 ccache rsync bc tree jq \
+          lib32z1-dev libx11-dev libgl1-mesa-dev libxml2-utils xsltproc unzip \
+          libncurses5-dev libxml2 lzop pngcrush schedtool squashfs-tools \
+          imagemagick libbz2-dev libssl-dev lzma ncftp bash-completion \
+          python2 python-is-python3 qemu-user-static
+        # 这几个在 20.04 上可能不存在，装不上不致命
+        sudo apt-get -y install lib32ncurses5-dev lib32readline-dev libsdl1.2-dev \
+          libwxgtk3.0-dev openjdk-8-jdk || \
+        sudo apt-get -y install lib32ncurses-dev lib32readline8 libsdl2-dev \
+          libwxgtk3.0-gtk3-dev openjdk-11-jdk || true
+
     - name: Install repo
       run: |
-        mkdir ~/bin
-        curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        export PATH=~/bin:$PATH
-      
+        mkdir -p "$HOME/bin"
+        curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > "$HOME/bin/repo"
+        chmod a+x "$HOME/bin/repo"
+        echo "$HOME/bin" >> "$GITHUB_PATH"
+
     - name: Initialize repo
       run: |
-        PATH=~/bin:$PATH
-        mkdir workspace
+        mkdir -p workspace
         cd workspace
-        echo "::set-output name=pwd::$(pwd)"
-        git config --global user.name "Hikaru's Action-Build-Bot"
-        git config --global user.email "Android@teio.tk"
-        repo init --depth=1 -u ${{ github.event.inputs.LIBRARY_URL }} -b ${{ github.event.inputs.LIBRARY_BRANCH }}
-      id: pwd
-          
+        git config --global user.name "Build Bot"
+        git config --global user.email "build@localhost"
+        repo init --depth=1 -u "${{ github.event.inputs.LIBRARY_URL }}" -b "${{ github.event.inputs.LIBRARY_BRANCH }}"
+
     - name: Repo Sync
       run: |
-        PATH=~/bin:$PATH
         cd workspace
-        repo sync -j$(nproc --all)
-      
+        repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle
+
     - name: Clone device
       run: |
-        PATH=~/bin:$PATH
-        cd ${{ steps.pwd.outputs.pwd }}
-        git clone ${{ github.event.inputs.DEVICE_URL }} -b ${{ github.event.inputs.DEVICE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
+        cd workspace
+        git clone "${{ github.event.inputs.DEVICE_URL }}" -b "${{ github.event.inputs.DEVICE_BRANCH }}" "./${{ github.event.inputs.DEVICE_PATH }}"
         git clone https://github.com/LineageOS/android_hardware_xiaomi.git -b lineage-18.1 ./hardware/xiaomi
 
     - name: Building
       run: |
-        PATH=~/bin:$PATH
-        cd ${{ steps.pwd.outputs.pwd }}
+        cd workspace
         export ALLOW_MISSING_DEPENDENCIES=true
         export LC_ALL=C
+        export USE_CCACHE=1
+        ccache -M 20G || true
         source build/envsetup.sh
-        lunch ${{ github.event.inputs.LIBRARY_NAME }}_${{ github.event.inputs.DEVICE_NAME }}-eng
+        lunch "${{ github.event.inputs.LIBRARY_NAME }}_${{ github.event.inputs.DEVICE_NAME }}-eng"
         make clean && make clobber
-        mka adbd bootimage -j$(nproc --all)
-        
+        mka ${{ github.event.inputs.BUILD_TARGET }} -j"$(nproc --all)"
+
+    - name: Publish artifacts (always)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        path: |
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
+        if-no-files-found: warn
+
     - name: Upload to Release
-      uses: softprops/action-gh-release@v1
+      if: success()
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/boot.img
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
         name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: Recovery for ${{ github.event.inputs.DEVICE_NAME }}
