@@ -82,13 +82,24 @@ jobs:
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
-        apt-get install -y --no-install-recommends \
-          git gnupg flex bison build-essential zip curl zlib1g-dev \
+        # 必需包：缺一个就编不了
+        PKGS_REQ="git gnupg flex bison build-essential zip curl zlib1g-dev \
           gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev \
           libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc \
           unzip jq bc ccache rsync tree python2 libssl-dev liblz4-tool \
-          libncurses5-dev libsdl1.2-dev libwxgtk3.0-dev openjdk-8-jdk \
-          squashfs-tools pngcrush lzop imagemagick qemu-user-static
+          libncurses5-dev libsdl1.2-dev openjdk-8-jdk squashfs-tools \
+          pngcrush lzop imagemagick"
+        apt-get install -y --no-install-recommends $PKGS_REQ \
+          || apt-get install -y $PKGS_REQ
+
+        # 可选包：名字随版本变（focal 是 libwxgtk3.0-gtk3-dev），装不上不致命
+        for p in libwxgtk3.0-gtk3-dev libwxgtk3.0-dev lib32readline-dev qemu-user-static; do
+          apt-get install -y --no-install-recommends "$p" || echo "  [跳过] $p 不可用"
+        done
+        echo "=== 关键工具自检 ==="
+        for c in git repo curl java python2 m4 make gcc; do
+          printf '  %-8s ' "$c"; command -v "$c" || true; echo
+        done
         curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > /usr/local/bin/repo
         chmod +x /usr/local/bin/repo
         git config --global user.name "Build Bot"
